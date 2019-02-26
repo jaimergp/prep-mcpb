@@ -35,8 +35,6 @@ except ImportError:
 
 from argparse import ArgumentParser
 from contextlib import contextmanager
-from cStringIO import StringIO
-from pprint import pprint
 from subprocess import check_call, CalledProcessError
 from textwrap import dedent
 from fileinput import input as fileinput
@@ -44,8 +42,6 @@ import os
 import random
 import string
 import sys
-import tempfile
-import time
 
 
 import chimera
