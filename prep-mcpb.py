@@ -299,7 +299,11 @@ def parameterize(molecule, reduce=False, net_charge='auto', charge_method='bcc',
             for line in f:
                 if line.startswith('@<TRIPOS>ATOM'):
                     lines.append(line)  # add current one before skipping
-                    line = next(f).replace('0.000000', str(float(molecule.charge)))
+                    line = next(f)
+                    fields = line.split()
+                    if fields[5] != fields[1]:
+                        line = line.replace(fields[5], fields[1])
+                    line = line.replace(fields[-1], str(float(molecule.charge)))
                 lines.append(line)
             f.seek(0)
             f.write(''.join(lines))
