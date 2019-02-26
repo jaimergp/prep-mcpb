@@ -69,7 +69,7 @@ def prepare_molecule_files(structure_query, interactive=True, charge_method='bcc
         for residue in residues:
             residue.charge = ask_for_charge(residue)
 
-    metal.basename = 'metal'
+    metal.basename = metal.atoms[0].element.name.upper()
     prepared_metal = parameterize(metal, net_charge=None)
     prepared_residues = []
 
