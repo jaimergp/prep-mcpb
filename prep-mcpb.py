@@ -24,12 +24,14 @@ try:
     patch_environ()
     load_chimera()
 except ImportError:
-    raise ImportError("This script needs PyChimera. Install it with `conda install -c insilichem pychimera`.")
+    raise ImportError("This script needs PyChimera. "
+                      "Install it with `conda install -c insilichem pychimera`.")
 
 try:
     import pdb4amber
 except ImportError:
-    raise ImportError("This script needs AmberTools. Install it with `conda install -c AmberMD ambertools`.")
+    raise ImportError("This script needs AmberTools. "
+                      "Install it with `conda install -c AmberMD ambertools`.")
 
 
 from argparse import ArgumentParser
@@ -217,8 +219,8 @@ def detect_metal_ions(molecule, interactive=True, remove_others=True):
         while True:
             s = raw_input('  There are several metal ions present!\n'
                           '  Optionally, provide a new residue name after a colon (e.g. 0:ZN)\n'
-                          '  Several ones can be specified for the same metal center with spaces (e.g. 0:ZN1 1:ZN2)\n'
-                          + msg + '\n  Choose now [0]:  ')
+                          '  Several ones can be specified for the same metal center with '
+                          'spaces (e.g. 0:ZN1 1:ZN2)\n' + msg + '\n  Choose now [0]:  ')
             try:
                 choices = _parse_metal_choice(s, len(metals))
                 chosen_metals = []
@@ -231,12 +233,14 @@ def detect_metal_ions(molecule, interactive=True, remove_others=True):
                     chosen_metals.append(metal)
                 names = [m.name for m in chosen_metals]
                 if len(names) != len(set(names)):
-                    raise ValueError('  Metal names contain repetitions. Please provide different names manually!')
+                    raise ValueError('  Metal names contain repetitions. Please provide '
+                                     'different names manually!')
             except ValueError as e:
                 print(e)
             else:
                 break
-        print('    Using {}... Any other metals will be removed!'.format(', '.join(map(str, chosen_metals))))
+        print('    Using {}... Any other metals will be removed!'.format(
+              ', '.join(map(str, chosen_metals))))
         for a in metals:
             if a not in chosen_metals:
                 molecule.deleteAtom(a)
@@ -352,7 +356,8 @@ def parameterize(molecule, reduce=False, net_charge='auto', charge_method='bcc',
         try:
             check_call(antechamber, stdout=f, stderr=f)
         except OSError:
-            raise KnownError("  !!! ERROR - antechamber could not be located. Have you installed ambertools?")
+            raise KnownError("  !!! ERROR - antechamber could not be located. "
+                             "Have you installed ambertools?")
         except CalledProcessError:
             raise KnownError('  !!! ERROR - Check antechamber_{}.log'.format(molecule.basename))
 
@@ -365,7 +370,8 @@ def parameterize(molecule, reduce=False, net_charge='auto', charge_method='bcc',
             try:
                 check_call(parmchk, stdout=f, stderr=f)
             except OSError:
-                raise KnownError("  !!! ERROR - parmchk2 could not be located. Have you installed ambertools?")
+                raise KnownError("  !!! ERROR - parmchk2 could not be located. "
+                                 "Have you installed ambertools?")
             except CalledProcessError:
                 raise KnownError('  !!! ERROR - Check parmchk2_{}.log'.format(molecule.basename))
 
