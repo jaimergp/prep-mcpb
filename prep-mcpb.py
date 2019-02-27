@@ -5,17 +5,16 @@
 Prepare files for MCPB.py using (py)Chimera
 ===========================================
 
-We need to pay special attention to these details:
+Current recipe:
 
-- Use PDB format 3.0
-- Use Amber nomenclature for protein residues (HID, HIE, HIP, HIS and so on) and atom names (`HA12` instead of `2HA1`).
-- Do not repeat atom names within the same residue (common in ligands)
-- Use CAPITALIZED names (as in ZN, but not Zn or zN) for residue AND atom names
-- The structures should contain all needed hydrogens
-- ISOLATED metal ions and non-standard residues should be embedded in separate residues each. This also means that they should have unique residue and atom names.
-- The total charge must be accurately specified before charge fitting!
-
-By the end of this stage one should have a PDB file with the correct residues (separated, good names) and one antechamber-generated mol2+frcmod files for each non-standard residue (containing accurate atom types and charges).
+1. Download or open the metal-containing structure. Remove waters, add hydrogens.
+2. Look for metal centers and make the user choose one. Non-chosen are deleted.
+3. Split it into protein, chosen metal and non-standard residues.
+4. Prepare/fix protein with pdb4amber+reduce.
+5. Estimate metal & ligand net charges with Chimera but allow the user to override them.
+6. antechamber metal PDB to obtain MOL2 and patch it with correct atom type and charge.
+7. antemchamber+parmchk the ligands.
+8. Generate the full PDB (master.pdb) with correct numbers and case via pdb4amber.
 """
 
 from __future__ import print_function, unicode_literals
