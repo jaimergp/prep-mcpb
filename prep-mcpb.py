@@ -288,8 +288,11 @@ def _parse_metal_choice(s, max_value):
         elif len(fields) == 2 and 0 < len(fields[1]) <= 3:
             name = fields[1]
         else:
-            raise ValueError('Wrong syntax!')
-        result.append((int(fields[0]), name))
+            raise ValueError('    !!! Wrong syntax!')
+        index = int(fields[0])
+        if index < 0 or index >= max_value:
+            raise ValueError('    !!! Index must be within 0 and ' + str(max_value))
+        result.append((index, name))
     return result
 
 
