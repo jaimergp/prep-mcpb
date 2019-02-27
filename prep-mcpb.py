@@ -160,7 +160,7 @@ def split(structure, interactive=True):
                 ligands = third_pieces
                 chimera.openModels.close([nonmetal])
             else: # the ligand is a single unit, nonmetal is left untouched
-        chimera.openModels.remove([nonmetal])
+                chimera.openModels.remove([nonmetal])
             # In this case, we need to patch the molecule name (CLI aesthetics)
             for ligand in ligands:
                 ligand.name += ' ' + ligand.residues[0].type
@@ -501,6 +501,7 @@ def parse_cli():
 
 def main():
     args = parse_cli()
+    print('Saving files and logs to', args.path)
     if os.path.isfile(args.structure):
         args.structure = os.path.abspath(args.structure)
     with change_working_dir(args.path):
