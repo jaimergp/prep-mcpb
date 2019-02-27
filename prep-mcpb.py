@@ -227,9 +227,7 @@ def detect_metal_ions(molecule, interactive=True, remove_others=True):
                 chosen_metals = []
                 for index, name in choices:
                     metal = metals[index]
-                    if name is None:
-                        metal.name = metal.element.name.upper()
-                    else:
+                    if name is not None:
                         metal.name = name
                     chosen_metals.append(metal)
                 names = [m.name for m in chosen_metals]
