@@ -142,14 +142,29 @@ def split(structure, interactive=True):
     nonmetal.name = nonmetal.name[:-2]  # remove id added at split
     chimera.openModels.add([nonmetal])
     ligands, proteins = [], []
-    second_pieces = split_molecule(nonmetal, chains=None, ligands=True, connected=None, atoms=None)
+    second_pieces = split_molecule(nonmetal, chains=None, ligands=True,
+                                   connected=None, atoms=None)
+
     if second_pieces:
         for p in second_pieces:
             (ligands if p.numResidues == 1 else proteins).append(p)
         chimera.openModels.close([nonmetal])
-    else:
-        proteins.append(nonmetal)
+    else:  # only one type of molecule present (protein or nonstandard residue)
+        (ligands if nonmetal.numResidues == 1 else proteins).append(nonmetal)
+
+        # If only one residue, antechamber needs separate ones for each connected unit
+        if ligands:
+            third_pieces = split_molecule(nonmetal, chains=None, ligands=None,
+                                          connected=True, atoms=None)
+            if third_pieces:  # we did split the ligand in parts
+                ligands = third_pieces
+                chimera.openModels.close([nonmetal])
+            else: # the ligand is a single unit, nonmetal is left untouched
         chimera.openModels.remove([nonmetal])
+            # In this case, we need to patch the molecule name (CLI aesthetics)
+            for ligand in ligands:
+                ligand.name += ' ' + ligand.residues[0].type
+
 
     pieces = metals + ligands + proteins
     chimera.openModels.add(pieces)
