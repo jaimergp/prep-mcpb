@@ -85,7 +85,7 @@ def prepare_molecule_files(structure_query, interactive=True, charge_method='bcc
             'protein': prepared_protein}
 
 
-def load_structure(query, reduce=True, strip='solvent'):
+def load_structure(query, reduce=True, strip='solvent&~@/pseudoBonds'):
     """
     Load a structure in Chimera. It can be anything accepted by `open` command.
 
@@ -96,7 +96,8 @@ def load_structure(query, reduce=True, strip='solvent'):
     reduce : bool
         Add hydrogens to structure. Defaults to True.
     strip : str
-        Chimera selection spec that will be removed. Defaults to solvent.
+        Chimera selection spec that will be removed. Defaults to solvent&~@/pseudoBonds
+        (solvent that is not attached to a metal ion).
     """
     print('Opening', query)
     chimera.runCommand('open ' + query)
@@ -467,7 +468,7 @@ def parse_cli():
     p.add_argument('-p', '--path',
         help='Directory that will host all generated files. If it does not exist, it will '
              'be created. If not provided, a 5-letter random string will be used.')
-    p.add_argument('--strip', default='solvent',
+    p.add_argument('--strip', default='solvent&~@/pseudoBonds',
         help='Atoms to be removed from original structure. By default, only the solvent. '
              'Any query supported by UCSF Chimera atom-spec can be used. For example, '
              'it can be used to delete unneeded NMR models with ~#0.1.')
