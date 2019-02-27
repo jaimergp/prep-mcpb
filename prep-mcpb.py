@@ -54,30 +54,33 @@ __author__ = "Jaime Rodríguez-Guerra"
 
 def prepare_molecule_files(structure_query, interactive=True, charge_method='bcc', strip='solvent'):
     structure = load_structure(structure_query, strip=strip)
-    metal, protein, residues = split(structure)
-    protein.basename = 'protein'
-    prepared_protein = prepare_protein_amber(protein)
+    metals, residues, proteins = split(structure)
 
-    if interactive:  # Ask for charges
-        print('Guessing charges...')
-        metal.charge = ask_for_charge(metal)
-        for residue in residues:
-            residue.charge = ask_for_charge(residue)
+    if proteins:
+        proteins[0].basename = 'protein'
+        prepared_protein = {'pdb': prepare_protein_amber(proteins[0])}
+    else:
+        prepared_protein = {}
 
-    metal.basename = metal.atoms[0].element.name.upper()
-    prepared_metal = parameterize(metal, net_charge=None)
+    print('Guessing charges...')
+    for res in metals + residues:
+        res.charge = ask_for_charge(res, interactive)
+
+    prepared_metals = []
+    for metal in metals:
+        metal.basename = metal.name.split()[-1]
+        metal.residues[0].type = metal.atoms[0].name = metal.atoms[0].element.name.upper()
+        prepared_metals.append(parameterize(metal, net_charge=None))
+
     prepared_residues = []
-
     for residue in residues:
         residue.basename = residue.residues[0].type
         parameterized = parameterize(residue, net_charge=residue.charge, charge_method=charge_method)
         prepared_residues.append(parameterized)
 
-    return {
-        'protein': {'pdb': prepared_protein},
-        'metal': prepared_metal,
-        'residues': prepared_residues
-    }
+    return {'metals': prepared_metals,
+            'residues': prepared_residues,
+            'protein': prepared_protein}
 
 
 def load_structure(query, reduce=True, strip='solvent'):
@@ -122,42 +125,60 @@ def split(structure, interactive=True):
         Non-standard residues
     """
     print('Preparing substructures...')
-    metal = detect_metal_ions(structure, interactive=interactive)        
-    pieces = split_molecule(structure, chains=None, ligands=True, connected=None, atoms=[[metal]])
+    # Separate metal ions from the rest
+    metal_atoms = detect_metal_ions(structure, interactive=interactive)
+    first_pieces = split_molecule(structure, chains=None, ligands=None, connected=None,
+                                  atoms=[[a] for a in metal_atoms])
+    metals, nonmetal = first_pieces[:-1], first_pieces[-1]  # metal ions are returned first
     chimera.openModels.close([structure])
+
+    for metal in metals:
+        metal.name = metal.name[:-1] + metal.atoms[0].name
+
+    # Separate ligands from protein
+    nonmetal.name = nonmetal.name[:-2]  # remove id added at split
+    chimera.openModels.add([nonmetal])
+    ligands, proteins = [], []
+    second_pieces = split_molecule(nonmetal, chains=None, ligands=True, connected=None, atoms=None)
+    if second_pieces:
+        for p in second_pieces:
+            (ligands if p.numResidues == 1 else proteins).append(p)
+        chimera.openModels.close([nonmetal])
+    else:
+        proteins.append(nonmetal)
+        chimera.openModels.remove([nonmetal])
+
+    pieces = metals + ligands + proteins
     chimera.openModels.add(pieces)
-    pieces[0].name = pieces[0].name[:-1] + pieces[0].atoms[0].element.name
-    pieces[0].basename = 'metal'
-    pieces[0].residues[0].type = pieces[0].atoms[0].element.name.upper()
-    pieces[1].name = pieces[1].name[:-1] + 'Protein'
-    pieces[1].basename = 'protein'
+
     # Detect repeated names for different residues
     res_by_name = {}
-    for piece in pieces[2:]:
-        resname = piece.residues[0].type
+    for mol in ligands:
+        resname = mol.residues[0].type
         if resname not in res_by_name:
-            res_by_name[resname] = piece
+            res_by_name[resname] = mol
         else:  # repeated name!
             while True:
                 new_name = _random_residue_type()
                 if new_name not in res_by_name:
-                    piece.name = piece.name.replace(piece.residues[0].type, new_name)
-                    piece.residues[0].type == new_name
-                    res_by_name[new_name] = piece
+                    mol.name = mol.name.replace(mol.residues[0].type, new_name)
+                    mol.residues[0].type = new_name
+                    res_by_name[new_name] = mol
                     break
 
     print('  Identified following substructures:')
     for piece in pieces:
-        print('   ', piece.name)
-    # metal, protein, residues
-    return pieces[0], pieces[1], pieces[2:]
+        print('    ', piece.name)
+    return metals, ligands, proteins
 
 
-def ask_for_charge(molecule):
+def ask_for_charge(molecule, interactive=True):
     """
     Ask the user for the correct charge but providing an estimated value
     """
     estimated = estimateNetCharge(molecule.atoms)
+    if not interactive:
+        return estimated
     while True:
         answer = raw_input('  Specify charge for {} [{}]: '.format(molecule.name, estimated))
         if not answer:
@@ -191,26 +212,80 @@ def detect_metal_ions(molecule, interactive=True, remove_others=True):
     metals = [a for a in molecule.atoms if a.element.isMetal]
     if interactive:
         metals.sort(key=lambda a: len(a.pseudoBonds), reverse=True)
-        msg = '\n'.join(['  {:>3d}) {} ({} coordination bonds)'.format(i, a, len(a.pseudoBonds)) for (i, a) in enumerate(metals)])
+        msg = '\n'.join(['  {:>3d}) {} ({} coordination bonds)'.format(i, a, len(a.pseudoBonds))
+                         for (i, a) in enumerate(metals)])
         while True:
-            choice = raw_input('  There are several metal ions present!\n' + msg + '\n' + '  Choose one [0]:  ')
-            if not choice:
-                choice = '0'
-            if choice.isdigit() and 0 <= int(choice) < len(metals):
-                break
+            s = raw_input('  There are several metal ions present!\n'
+                          '  Optionally, provide a new residue name after a colon (e.g. 0:ZN)\n'
+                          '  Several ones can be specified for the same metal center with spaces (e.g. 0:ZN1 1:ZN2)\n'
+                          + msg + '\n  Choose now [0]:  ')
+            try:
+                choices = _parse_metal_choice(s, len(metals))
+                chosen_metals = []
+                for index, name in choices:
+                    metal = metals[index]
+                    if name is None:
+                        metal.name = metal.element.name.upper()
+                    else:
+                        metal.name = name
+                    chosen_metals.append(metal)
+                names = [m.name for m in chosen_metals]
+                if len(names) != len(set(names)):
+                    raise ValueError('  Metal names contain repetitions. Please provide different names manually!')
+            except ValueError as e:
+                print(e)
             else:
-                print('  Please provide a valid number!')
-        metal = metals[int(choice)]
-        print('    Using', metal, '... Any other metals will be removed!')
+                break
+        print('    Using {}... Any other metals will be removed!'.format(', '.join(map(str, chosen_metals))))
         for a in metals:
-            if a is not metal:
+            if a not in chosen_metals:
                 molecule.deleteAtom(a)
-        return metal
+        return chosen_metals
     elif len(metals) == 1:
         return metals[0]
     else:
         raise ValueError('More than one metal present: {}'.format(
                          ', '.join([str(a) for a in metals])))
+
+
+def _parse_metal_choice(s, max_value):
+    """
+    Parse user options provided in ``detect_metal_options``.
+
+    The syntax is <position>,[<new name>], using semicolons to choose several ones.
+    <new name> can only be 3-letters max and should not collide with existing Amber
+    types. This is not checked, so be careful! If you choose several ones, they
+    are considered part of the same metal center! Do not use it for unrelated ions;
+    instead run the script several times and use the step 1n.
+    For example:
+
+        - 0  # would select the first one (default), without renaming
+        - 0:ZN1 # select first one with a new name (ZN1)
+        - 0:ZN1 1:ZN2 # select first and second with new names
+
+    Parameters
+    ==========
+    s : str
+
+    Return
+    ======
+    list of (index, name)
+        name can be None
+    """
+    if not s:
+        return [(0, None)]
+    result = []
+    for selection in s.split():
+        name = None
+        fields = selection.split(':')
+        if len(fields) == 1:
+            name == None
+        elif len(fields) == 2 and 0 < len(fields[1]) <= 3:
+            name = fields[1]
+        else:
+            raise ValueError('Wrong syntax!')
+        result.append((int(fields[0]), name))
+    return result
 
 
 def parameterize(molecule, reduce=False, net_charge='auto', charge_method='bcc', atom_type='gaff'):
@@ -228,7 +303,7 @@ def parameterize(molecule, reduce=False, net_charge='auto', charge_method='bcc',
     charge_method : str, default='bcc'
         Method used by -c option in antechamber. Available options:
         resp, bcc, cm2, esp, mul, gas
-    
+
 
     Returns
     -------
@@ -249,7 +324,7 @@ def parameterize(molecule, reduce=False, net_charge='auto', charge_method='bcc',
         if net_charge == 'auto':
             net_charge = estimateNetCharge(molecule.atoms)
         options = {'net_charge': net_charge, 'charge_method': charge_method}
-    
+
     for b in molecule.bonds:
         molecule.deleteBond(b)
     inpdb = molecule.basename + '.pdb'
@@ -295,9 +370,7 @@ def parameterize(molecule, reduce=False, net_charge='auto', charge_method='bcc',
                 raise KnownError('  !!! ERROR - Check parmchk2_{}.log'.format(molecule.basename))
 
     result = {'pdb': antechamber[6], 'mol2': antechamber[8]}
-    if is_metal:  
-        result['restype'] = molecule.residues[0].type
-        # add charge to mol2
+    if is_metal:   # fix charge and atom type in antechamber-generated mol2
         with open(antechamber[8], 'r+') as f:
             lines = []
             for line in f:
@@ -305,9 +378,9 @@ def parameterize(molecule, reduce=False, net_charge='auto', charge_method='bcc',
                     lines.append(line)  # add current one before skipping
                     line = next(f)
                     fields = line.split()
-                    if fields[5] != fields[1]:
+                    if fields[5] != fields[1]:  # fix atom type if it does not match resname
                         line = line.replace(fields[5], fields[1])
-                    line = line.replace(fields[-1], str(float(molecule.charge)))
+                    line = line.replace(fields[-1], str(float(molecule.charge)))  # replace charge
                 lines.append(line)
             f.seek(0)
             f.write(''.join(lines))
@@ -349,48 +422,43 @@ def prepare_mcpb_input(structures, software_version='g09', cut_off=2.8):
     ion_mol2files {metal_mol2}
     naa_mol2files {residues_mol2}
     frcmod_files {residues_frcmod}
-    large_opt {large_opt}
+    large_opt 1
     software_version {software_version}
     """)
 
     # First collect all files in the same master PDB
+    pdbfiles = [s['pdb'] for s in structures['metals'] + structures['residues']]
+    if 'pdb' in structures['protein']:
+        pdbfiles.append(structures['protein']['pdb'])
 
     with open('master.unfixed.pdb', 'w') as f:
-        pdbfiles = [structures['protein']['pdb'], structures['metal']['pdb']] + \
-                   [r['pdb'] for r in structures['residues']]
         for line in fileinput(pdbfiles):
             f.write(line)
 
     # Fix residue numbering issues
     pdb4amber.run(arg_pdbin='master.unfixed.pdb', arg_pdbout='master.pdb')
-    
-    # Find metal ID
-    for line in fileinput('master.pdb'):
-        if line[17:21].strip() == structures['metal']['restype']:
-            metal_id = int(line[6:12])
 
     name = os.path.basename(os.getcwd())
     with open('mcbp.in', 'w') as f:
         f.write(template.format(
-            name=name, 
-            metal_id=metal_id, 
-            metal_mol2=structures['metal']['mol2'],
+            name=name,
+            metal_id=' '.join(map(str, range(1, len(structures['metals']) + 1))),
+            metal_mol2=' '.join([s['mol2'] for s in structures['metals']]),
             residues_mol2=' '.join([r['mol2'] for r in structures['residues']]),
             residues_frcmod=' '.join([r['frcmod'] for r in structures['residues']]),
             cut_off=cut_off,
             software_version=software_version,
-            large_opt=1
         ))
-    
+
     return 'mcbp.in'
 
 
 def parse_cli():
     p = ArgumentParser()
-    p.add_argument('structure', 
+    p.add_argument('structure',
         help='Structure to load. Can be a file or a identifier compatible with Chimera '
              'open command (e.g. pdb:4zf6)')
-    p.add_argument('-p', '--path', 
+    p.add_argument('-p', '--path',
         help='Directory that will host all generated files. If it does not exist, it will '
              'be created. If not provided, a 5-letter random string will be used.')
     p.add_argument('--strip', default='solvent',
@@ -410,8 +478,10 @@ def parse_cli():
 
 def main():
     args = parse_cli()
+    if os.path.isfile(args.structure):
+        args.structure = os.path.abspath(args.structure)
     with change_working_dir(args.path):
-        structures = prepare_molecule_files(args.structure, strip=args.strip, 
+        structures = prepare_molecule_files(args.structure, strip=args.strip,
                                             charge_method=args.chargemethod)
         prepare_mcpb_input(structures, cut_off=args.cutoff)
     return args
@@ -451,7 +521,7 @@ if __name__ == "__main__":
         print('Feel free to edit some parameters if needed (e.g. large_opt 1, etc).')
         print('You should be able to cd into `{}` and run the first MCPB.py step:'.format(args.path))
         print('    cd', args.path)
-        print('    MCPB.py -i mcbp.in -s 1')
+        print('    MCPB.py -i mcbp.in -s 1n  # n -> do not rename metal ions')
         print(', which should generate G09 input files to be processed with:')
         print('    MCPB.py -i mcbp.in -s 2')
         print('...and so on. Good luck!')
