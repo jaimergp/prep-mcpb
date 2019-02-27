@@ -52,8 +52,8 @@ __version__ = "0.0.1"
 __author__ = "Jaime Rodríguez-Guerra"
 
 
-def prepare_molecule_files(structure_query, interactive=True, charge_method='bcc'):
-    structure = load_structure(structure_query)
+def prepare_molecule_files(structure_query, interactive=True, charge_method='bcc', strip='solvent'):
+    structure = load_structure(structure_query, strip=strip)
     metal, protein, residues = split(structure)
     protein.basename = 'protein'
     prepared_protein = prepare_protein_amber(protein)
@@ -80,18 +80,27 @@ def prepare_molecule_files(structure_query, interactive=True, charge_method='bcc
     }
 
 
-def load_structure(query, reduce=True, remove_solvent=True):
+def load_structure(query, reduce=True, strip='solvent'):
     """
     Load a structure in Chimera. It can be anything accepted by `open` command.
+
+    Parameters
+    ==========
+    query : str
+        Path to molecular file, or special query for Chimera's open (e.g. pdb:3pk2).
+    reduce : bool
+        Add hydrogens to structure. Defaults to True.
+    strip : str
+        Chimera selection spec that will be removed. Defaults to solvent.
     """
     print('Opening', query)
     chimera.runCommand('open ' + query)
     m = chimera.openModels.list()[0]
     m.setAllPDBHeaders({})
 
-    if remove_solvent:
-        print('  Removing solvent...')
-        chimera.runCommand('del solvent')
+    if strip:
+        print('  Removing {}...'.format(strip))
+        chimera.runCommand('del ' + strip)
     if reduce:
         print('  Adding hydrogens...')
         chimera.runCommand('addh')
@@ -384,6 +393,10 @@ def parse_cli():
     p.add_argument('-p', '--path', 
         help='Directory that will host all generated files. If it does not exist, it will '
              'be created. If not provided, a 5-letter random string will be used.')
+    p.add_argument('--strip', default='solvent',
+        help='Atoms to be removed from original structure. By default, only the solvent. '
+             'Any query supported by UCSF Chimera atom-spec can be used. For example, '
+             'it can be used to delete unneeded NMR models with ~#0.1.')
     p.add_argument('--chargemethod', choices='resp bcc cm2 esp mul gas'.split(),
         default='bcc', help='Charge method to use with antechamber. Default is bcc.')
     p.add_argument('--cutoff', default=2.8, type=float,
@@ -398,7 +411,8 @@ def parse_cli():
 def main():
     args = parse_cli()
     with change_working_dir(args.path):
-        structures = prepare_molecule_files(args.structure, charge_method=args.chargemethod)
+        structures = prepare_molecule_files(args.structure, strip=args.strip, 
+                                            charge_method=args.chargemethod)
         prepare_mcpb_input(structures, cut_off=args.cutoff)
     return args
 
