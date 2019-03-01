@@ -1,4 +1,19 @@
 
+from __future__ import print_function
+try:
+    from pychimera import patch_environ, load_chimera
+    patch_environ()
+    load_chimera()
+except ImportError:
+    raise ImportError("This script needs PyChimera. "
+                      "Install it with `conda install -c insilichem pychimera`.")
+
+try:
+    from pdb4amber import AmberPDBFixer
+    import parmed as pmd
+except ImportError:
+    raise ImportError("This script needs AmberTools. "
+                      "Install it with `conda install -c AmberMD ambertools`.")
 
 import os
 import string
@@ -7,13 +22,19 @@ from collections import defaultdict
 from textwrap import dedent
 from cStringIO import StringIO
 from subprocess import check_call, CalledProcessError
+from contextlib import contextmanager
+from argparse import ArgumentParser
+from tempfile import mkdtemp
 
 import numpy as np
 
 import chimera
+from chimera.specifier import evalSpec as chimera_selection
 from AddH import cmdAddH
 from AddCharge import estimateNetCharge
 from SplitMolecule.split import molecule_from_atoms, split_connected
+from Combine import cmdCombine
+
 
 ### BASE OBJECTS
 _valid_resname_characters = string.ascii_letters + string.digits + '-+'
@@ -43,13 +64,13 @@ class MCPBWorkspace(object):
             os.makedirs(root)
         except OSError:
             if os.listdir(root):
-                raise ValueError('{} is not empty!')
+                raise ValueError('Directory `{}` is not empty!'.format(root))
         self.root = root
         if prefix is None:
             prefix = os.path.basename(root)[:4]
         self.prefix = validate_short_id(prefix)
 
-    def write(self, contents, filename, directory=None):
+    def write(self, contents, filename, directory=None, prefix=None):
         """
         contents : file, file-like, path, str
             The contents of the file to write
@@ -66,7 +87,8 @@ class MCPBWorkspace(object):
             with open(contents) as f:
                 contents = f.read()
         # else contents is a str
-        filename = '{}_{}'.format(self.prefix, filename)
+        if prefix:
+            filename = '{}{}'.format(self.prefix, filename)
         if directory:
             try:
                 os.makedirs(os.path.join(self.root, directory))
@@ -80,6 +102,86 @@ class MCPBWorkspace(object):
             f.write(contents)
 
         return path
+
+    def save(self, metals, nonstd_residues=(), protein=None):
+        """
+        Parameters
+        ==========
+        metals : list of MetalResidue, optional
+            As provided by MetalResidueProvider.detect(). It can be
+            set afterwards (before .save()).
+        nonstd_residues : list of NonStandardResidue
+            As provided by NonStandardResidueProvider.detect(). It can be
+            set afterwards (before .save()).
+        protein : Protein
+            As provided by ProteinProvider.detect(). It can be
+            set afterwards (before .save()).
+        """
+        pdbfiles = []
+        ion_mol2files = []
+        for center in metals:
+            pdbfiles.append(center.to_pdb())
+            for key, contents in center.to_mol2().items():
+                self.write(contents, key + '.mol2')
+                ion_mol2files.append(key + '.mol2')
+        n_metals = sum([center.molecule.numAtoms for center in metals])
+        ion_ids = range(1, n_metals+1)
+        naa_mol2files, frcmod_files = [], []
+        for ligand in nonstd_residues:
+            files = ligand.parameterize()
+            pdbfiles.append(files['pdb'])
+            self.write(files['mol2'], ligand.name + '.mol2')
+            self.write(files['frcmod'], ligand.name + '.frcmod')
+            naa_mol2files.append(ligand.name + '.mol2')
+            frcmod_files.append(ligand.name + '.frcmod')
+
+        if protein:
+            pdbfiles.append(protein.to_pdb(fix=True))
+
+        self.write(self.master_pdb(pdbfiles), 'master.pdb')
+        inputfile = self.mcpb_input(ion_ids=ion_ids, ion_mol2files=ion_mol2files,
+                                    naa_mol2files=naa_mol2files, frcmod_files=frcmod_files)
+        self.write(inputfile, 'mcpb.in')
+
+    @staticmethod
+    def master_pdb(pdbfiles):
+        s = StringIO()
+        s.write("\n".join(pdbfiles))
+        s.seek(0)
+        pdbfixer = AmberPDBFixer(pmd.formats.PDBFile().parse(s))
+        s = StringIO()
+        pdbfixer.write_pdb(s)
+        s.seek(0)
+        s = s.read()
+        print(s)
+        return s
+
+    def mcpb_input(self, ion_ids, ion_mol2files, naa_mol2files=(), frcmod_files=()):
+        """
+        ion_ids : list of int
+            Serial numbers of each metal ion as present in the master PDB file
+        ion_mol2files : list of str
+            Filenames of each metal residue TYPE as generated with MetalResidue.to_mol2()
+        naa_mol2files : list of str, optional, default=()
+            Filenames of each non-standard residue (ligand) mol2 as generated with antechamber
+        frcmod_files : list of str, optional, default=()
+            Filenames of each non-standard residue (ligand) frcmod as generated with parmchk2
+        """
+        return dedent("""
+            original_pdb master.pdb
+            group_name {group_name}
+            cut_off 2.8
+            ion_ids {ion_ids}
+            ion_mol2files {ion_mol2files}
+            naa_mol2files {naa_mol2files}
+            frcmod_files {frcmod_files}
+            large_opt 1
+            software_version g09
+            """).format(group_name=self.prefix,
+                        ion_ids=' '.join(map(str, ion_ids)),
+                        ion_mol2files=' '.join(ion_mol2files),
+                        naa_mol2files=' '.join(naa_mol2files),
+                        frcmod_files=' '.join(frcmod_files))
 
 
 class RawStructure(object):
@@ -109,9 +211,11 @@ class RawStructure(object):
         chimera.runCommand('open ' + query)
         self._molecule = chimera.openModels.list(modelTypes=[chimera.Molecule])[_previously_opened]
         if name is None:
-            self.name = validate_short_id(self._molecule.name[:6])
+            name = validate_short_id(self._molecule.name[:6])
+        self.name = name
         # Create copy; original is stored at self._molecule
-        self.molecule = cmdCombine([self._molecule], name=self.name, modelId=self._molecule.id, log=False)
+        cmdCombine([self._molecule], name=self.name, modelId=self._molecule.id, log=False)
+        self.molecule = chimera.openModels.list(modelTypes=[chimera.Molecule])[_previously_opened+1]
         chimera.openModels.remove([self._molecule])  # hide it from model panel
 
     def strip(self, to_remove='solvent&~@/pseudoBonds'):
@@ -125,29 +229,48 @@ class RawStructure(object):
             of atoms to be removed
         """
         if isinstance(to_remove, basestring):  # assume is a chimera DSL
-            atoms = chimera.selection.OSLSelection(to_remove, models=[self.molecule])
+            atoms = chimera_selection(to_remove, models=[self.molecule]).atoms()
         removed = []
         for a in atoms:
             if a in self.molecule.atoms:
                 removed.append('{} serial {}'.format(a, a.serialNumber))
-                self.molecule.removeAtom(a)
+                self.molecule.deleteAtom(a)
         return removed
 
     def add_h(self, **kwargs):
         kwargs.pop('molecules', None)
         cmdAddH(molecules=[self.molecule], **kwargs)
 
-    def metals():
-        return MetalResidueProvider(self.molecule)
+    def metals(self, **kwargs):
+        return MetalResidueProvider(self.molecule, **kwargs).detect()
 
-    def ligands():
-        return NonStandardResidueProvider(self.molecule)
+    def nonstd_residues(self, **kwargs):
+        return NonStandardResidueProvider(self.molecule).detect(**kwargs)
 
-    def protein():
-        return ProteinProvider(self.molecule)
+    def protein(self, **kwargs):
+        return ProteinProvider(self.molecule, **kwargs).detect()
 
-    def close():
+    def close(self, **kwargs):
         chimera.openModels.close([self._molecule, self.molecule])
+
+
+class PDBExportable(object):
+
+    def __init__(self, molecule):
+        self.molecule = molecule
+
+    def to_pdb(self, molecule=None, **kwargs):
+        """
+        Export current molecule to a PDB file
+        """
+        if molecule is None:
+            molecule = self.molecule
+        s = StringIO()
+        chimera.openModels.add([molecule])
+        chimera.pdbWrite([molecule], molecule.openState.xform, s, **kwargs)
+        chimera.openModels.remove([molecule])
+        s.seek(0)
+        return s.read()
 
 
 ### METAL OBJECTS
@@ -164,7 +287,7 @@ class MetalResidueProvider(object):
         clusters = self.detect_clusters(metals)
         residues = []
         for cluster in clusters:
-            residues.append(MetalResidue(*cluster))
+            residues.append(MetalResidue(cluster))
         return residues
 
     def detect_clusters(self, metals):
@@ -188,7 +311,7 @@ class MetalResidueProvider(object):
 
         # 2. Iterate over previous sets trying to merge them if they
         #    have at least two atoms within cutoff
-        clusters =[set([k] + v) for k, v in nearby.items()]
+        clusters = [set([k] + v) for k, v in nearby.items()]
         merged = []
         clusters2 = clusters[:]
         for seed in clusters2:
@@ -214,7 +337,7 @@ class MetalResidueProvider(object):
         return sorted(saved, key=len, reverse=True)
 
 
-class MetalResidue(object):
+class MetalResidue(PDBExportable):
 
     """
     Group of metal ions that are close to each other and can be
@@ -222,6 +345,7 @@ class MetalResidue(object):
     """
 
     def __init__(self, atoms, name=None):
+        atoms = list(atoms)
         if name is None:
             name = atoms[0].element.name
         self.molecule = chimera.Molecule()
@@ -229,13 +353,15 @@ class MetalResidue(object):
         atoms_by_element = defaultdict(list)
         for a in atoms:
             atoms_by_element[a.element.name].append(a)
-
-        for index, (element, atomlist) in enumerate(sorted(atoms_by_element.items()), 1):
-            new_atom = self.molecule.newAtom(atom.name, atom.element, i)
-            new_atom.charge = estimateNetCharge(new_atom)
-            new_atom.setCoord(atom.coord())
-            residue = self.molecule.newResidue(element.upper(), 'A', index, ' ')
-            residue.addAtom(new_atom)
+        atomindex = 0
+        for resindex, (element, atomlist) in enumerate(sorted(atoms_by_element.items()), 1):
+            residue = self.molecule.newResidue(element.upper(), 'A', resindex, ' ')
+            for atom in atomlist:
+                atomindex += 1
+                new_atom = self.molecule.newAtom(atom.name, atom.element, atomindex)
+                new_atom.charge = estimateNetCharge([new_atom])
+                new_atom.setCoord(atom.coord())
+                residue.addAtom(new_atom)
 
     @property
     def charge(self):
@@ -276,48 +402,44 @@ class MetalResidue(object):
                 resid=r.id.position)
         return files
 
-    def to_pdb(self):
-        """
-        Export current molecule to a PDB file
-        """
-        s = StringIO()
-        chimera.writePdb(self.molecule, self.molecule.openState.xform, s)
-        s.seek(0)
-        return s.read()
-
 
 ### LIGAND OBJECTS (non-protein, non-metal)
 
 class NonStandardResidueProvider(object):
 
-    def __init__(self, molecule):
+    def __init__(self, molecule, **kwargs):
         self.molecule = molecule
+        self._kwargs = kwargs
 
-    def detect(self):
+    def detect(self, **kwargs):
         """
         Detect connected residues
 
         TODO: Identify topologically identical pieces
         """
-        candidate_atoms = chimera.evalSpec('~protein&~solvent',
-                                           models=[self.molecule]).atoms()
+        atoms = chimera_selection('~protein&~solvent', models=[self.molecule]).atoms()
+        candidate_atoms = [a for a in atoms if not a.element.isMetal]
         pieces_by_resname = defaultdict(list)
-        for piece in split_connected(candidate_atoms):
-            pieces_by_resname[piece.residues[0].type].append(piece)
+        for i, atoms in split_connected(candidate_atoms):
+            if len(atoms) == 1:
+                print('! Warning: nonstd residue of 1 atom will be ignored', str(atoms[0]))
+            else:
+                pieces_by_resname[atoms[0].residue.type].append(atoms)
 
-        for resname, pieces in pieces_by_resname.items():
-            if len(pieces) > 1:
-                for i, piece in enumerate(pieces, 1):
-                    pieces_by_resname[resname[:-1] + str(i)] = [piece]
-                del pieces_by_resname[resname]
+        # TODO: Review if this is needed or not
+        # for resname, pieces in pieces_by_resname.items():
+        #     if len(pieces) > 1:  # rename residues with more than one group of atoms
+        #         for i, piece in enumerate(pieces, 1):
+        #             pieces_by_resname[resname[:-1] + str(i)] = [piece]
+        #         del pieces_by_resname[resname]
 
         residues = []
         for resname, piece in sorted(pieces_by_resname.items()):
-            residues.append(NonStandardResidue(piece, name=resname))
+            residues.append(NonStandardResidue(piece[0], name=resname, extra_xyz=piece[1:], **kwargs))
         return residues
 
 
-class NonStandardResidue(object):
+class NonStandardResidue(PDBExportable):
     """
     A non-metal, non-protein connected molecule that must
     be parameterized with antechamber.
@@ -335,32 +457,51 @@ class NonStandardResidue(object):
         is present several times in the same structure, parameterize
         only once but build the final PDB with all the extra
         positions.
+    atom_type : str, optional=gaff
+        Used by antechamber.
+    charge_method : str, optional=bcc
+        Used by antechamber. Choose between
     """
-
-    def __init__(self, atoms, name=None, charge=None, extra_xyz=(,)):
+    _charge_methods = 'resp bcc cm2 esp mul gas'.split()
+    _atom_types = 'gaff gaff2'.split()
+    def __init__(self, atoms, name=None, charge=None, extra_xyz=(), atom_type='gaff', charge_method='bcc'):
         if name is None:
             name = atoms[0].residue.type
         self.name = validate_short_id(name)
         self.molecule = molecule_from_atoms(atoms[0].molecule, atoms, name=self.name)
-        for i, xyz in enumerate(extra_xyz, 1):
-            if len(xyz) != 3:
-                raise ValueError('`extra_xyz` must be of shape (n, 3)')
-            cs = self.molecule.newCoordSet(i)
-            cs.load(xyz)
+        # for i, xyz in enumerate(extra_xyz, 1):
+        #     if len(xyz) != 3:
+        #         raise ValueError('`extra_xyz` must be of shape (n, 3)')
+        #     cs = self.molecule.newCoordSet(i)
+        #     cs.load(xyz)
+        if not all([m.numAtoms == len(atoms) for m in extra_xyz]):
+            raise ValueError("Extra molecules must have same number of atoms as the main one!")
+        else:
+            self.extra_xyz = [molecule_from_atoms(at[0].molecule, at, name=self.name) for at in extra_xyz]
         if charge is None:
-            charge = estimateNetCharge(charge)
+            charge = estimateNetCharge(atoms)
         self.charge = charge
+        if atom_type not in self._atom_types:
+            raise ValueError('atom_type must be one of {}'.format(', '.join(self._atom_types)))
+        self.atom_type = atom_type
+        if charge_method not in self._charge_methods:
+            raise ValueError('charge_method must be one of {}'.format(', '.join(self._charge_methods)))
+        self.charge_method = charge_method
 
-    def parameterize(self, atom_type='gaff', charge_method='bcc'):
+    def parameterize(self, atom_type=None, charge_method=None):
         """
         Run antechamber and parmchk to obtain mol2 and frcmod files with
         residue parameters
         """
+        if atom_type is None:
+            atom_type = self.atom_type
+        if charge_method is None:
+            charge_method = self.charge_method
         pdb = self.name + '.pdb'
         mol2 = self.name + '.mol2'
         frcmod = self.name + '.frcmod'
-        with enter_temporary_directory():
-            with open(self.name, 'w') as f:
+        with enter_temporary_directory(delete=False) as tmpdir:
+            with open(pdb, 'w') as f:
                 f.write(self.to_pdb(replicas=False))
 
             # Run antechamber
@@ -376,7 +517,7 @@ class NonStandardResidue(object):
                     raise KnownError("  !!! ERROR - antechamber could not be located. "
                                     "Have you installed ambertools?")
                 except CalledProcessError:
-                    raise KnownError('  !!! ERROR - Check antechamber_{}.log'.format(molecule.basename))
+                    raise KnownError('  !!! ERROR - Check {}/{}-antechamber.log'.format(tmpdir, self.name))
 
             # Run parmchk
             cmd = 'parmchk2 -i INPUT -o OUTPUT -f mol2'.split()
@@ -389,7 +530,7 @@ class NonStandardResidue(object):
                     raise KnownError("  !!! ERROR - parmchk2 could not be located. "
                                     "Have you installed ambertools?")
                 except CalledProcessError:
-                    raise KnownError('  !!! ERROR - Check parmchk2_{}.log'.format(molecule.basename))
+                    raise KnownError('  !!! ERROR - Check {}/{}-parmchk2.log'.format(tmpdir, self.name))
 
             # Read files to return them back (tempdir will be erased at exit!)
             result = {}
@@ -410,39 +551,129 @@ class NonStandardResidue(object):
             only the primary one. Set to True when building the
             master, False for parameterization.
         """
-        s = StringIO()
-        # TODO: build a new molecule with all the residues, instead of using coordsets
-        chimera.writePdb(self.molecule, self.molecule.openState.xform, s, replicas)
-        s.seek(0)
-        return s.read()
+        if replicas:
+            multimol = cmdCombine  # TODO: combine all replicas in a new multiresidue molecule
+        return PDBExportable.to_pdb(self, allFrames=replicas)
 
 
 
 ### PROTEIN OBJECTS
 
 class ProteinProvider(object):
-    pass
+
+    def __init__(self, molecule, name=None):
+        self.molecule = molecule
+        if name is None:
+            name = molecule.name.split()[0][:4]
+        self.name = validate_short_id(name)
+
+    def detect(self):
+        atoms = chimera_selection('protein', models=[self.molecule]).atoms()
+        if atoms:
+            return Protein(atoms, self.name)
 
 
-class Protein(object):
-    pass
+class Protein(PDBExportable):
+
+    def __init__(self, atoms, name=None):
+        if name is None:
+            name = atoms[0].molecule.name.split([0])[:4]
+        self.name = validate_short_id(name)
+        self.molecule = molecule_from_atoms(atoms[0].molecule, atoms, name=self.name)
+
+    def fix(self, add_h=True):
+        s = StringIO()
+        s.write(self.to_pdb())
+        s.seek(0)
+        pdbfixer = AmberPDBFixer(pmd.formats.PDBFile().parse(s))
+        if add_h:
+            pdbfixer.add_hydrogen()
+
+        # Assign HIS/HID/HIE correctly
+        pdbfixer.assign_histidine()
+        # Fix CYS -> CYX if needed
+        sslist, cys_cys_atomidx_set = pdbfixer.find_disulfide()
+        pdbfixer.rename_cys_to_cyx(sslist)
+
+        # Remove altLocs
+        for atom in pdbfixer.parm.atoms:
+            atom.altloc = ''
+            for oatom in atom.other_locations.values():
+                oatom.altloc = ''
+
+        output = pdbfixer._write_pdb_to_stringio(
+            cys_cys_atomidx_set=cys_cys_atomidx_set,
+            disulfide_conect=True)
+
+        output.seek(0)
+        return output.read()
+
+    def to_pdb(self, fix=False):
+        if fix:
+            return self.fix()
+        return PDBExportable.to_pdb(self)
 
 
 @contextmanager
 def enter_temporary_directory(delete=True, **kwargs):
     old_dir = os.getcwd()
-    tmpdir = tempfile.mkdtemp(**kwargs)
+    path = mkdtemp(**kwargs)
     os.chdir(path)
-    yield
+    yield path
     os.chdir(old_dir)
     if delete:
         shutil.rmtree(path, ignore_errors=True)
 
 
+class KnownError(BaseException):
+    pass
+
+
+def parse_cli():
+    p = ArgumentParser()
+    p.add_argument('structure',
+        help='Structure to load. Can be a file or a identifier compatible with Chimera '
+             'open command (e.g. pdb:4zf6)')
+    p.add_argument('-p', '--path',
+        help='Directory that will host all generated files. If it does not exist, it will '
+             'be created. If not provided, a 5-letter random string will be used.')
+    p.add_argument('--strip', default='solvent&~@/pseudoBonds',
+        help='Atoms to be removed from original structure. By default, only the solvent. '
+             'Any query supported by UCSF Chimera atom-spec can be used. For example, '
+             'it can be used to delete unneeded NMR models with ~#0.1.')
+    p.add_argument('--charge_method', choices='resp bcc cm2 esp mul gas'.split(),
+        default='bcc', help='Charge method to use with antechamber. Default is bcc.')
+    p.add_argument('--atom_type', choices='gaff gaff2'.split(),
+        default='gaff', help='Atom types used by antechamber. Default is gaff.')
+    p.add_argument('--cluster_cutoff', default=3.5, type=float,
+        help='Cutoff (in A) used to find clusters of metals in the provided structure. '
+             'It is the maximum distance a metal ion can be from other nearby. Default is 3.5.')
+    p.add_argument('--mcpb_cutoff', default=2.8, type=float,
+        help='Cutoff (in A) used by MCPB.py to build small and large models. Default is 2.8. '
+             'Feel free to edit the resulting `mcpb.in` to change other parameters.')
+    args = p.parse_args()
+    if args.path is None:
+        args.path = ''.join([random.choice(string.ascii_letters) for i in range(5)])
+    return args
+
+
 def main():
-    structure = RawStructure()
-    structure.clean()
-    structure.reduce()
-    metals = structure.metals()
-    ligands = structure.ligands()
+    args = parse_cli()
+    name = validate_short_id(os.path.basename(args.path))
+    # Load requested structure and do global fixes
+    structure = RawStructure(args.structure, name=name)
+    structure.strip(to_remove=args.strip)
+    structure.add_h()
+
+    # Discover components
+    metals = structure.metals(cluster_cutoff=args.cluster_cutoff)
+    nonstd_residues = structure.nonstd_residues(charge_method=args.charge_method, atom_type=args.atom_type)
     protein = structure.protein()
+
+    # Write everything to the results directory
+    workspace = MCPBWorkspace(args.path, prefix=name)
+    workspace.save(metals=metals, nonstd_residues=nonstd_residues, protein=protein)
+
+
+if __name__ == "__main__":
+    main()
