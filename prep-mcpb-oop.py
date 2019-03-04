@@ -488,11 +488,6 @@ class NonStandardResidue(PDBExportable):
             name = atoms[0].residue.type
         self.name = validate_short_id(name)
         self.molecule = molecule_from_atoms(atoms[0].molecule, atoms, name=self.name)
-        # for i, xyz in enumerate(extra_xyz, 1):
-        #     if len(xyz) != 3:
-        #         raise ValueError('`extra_xyz` must be of shape (n, 3)')
-        #     cs = self.molecule.newCoordSet(i)
-        #     cs.load(xyz)
         if not all([len(m) == len(atoms) for m in extra_xyz]):
             raise ValueError("Extra molecules must have same number of atoms as the main one!")
         else:
@@ -560,7 +555,7 @@ class NonStandardResidue(PDBExportable):
 
         return result
 
-    def to_pdb(self, conformers=True):
+    def to_pdb(self, conformers=True, **kwargs):
         """
         Export current molecule to a PDB file
 
@@ -578,10 +573,9 @@ class NonStandardResidue(PDBExportable):
             and each variant. If False, str of PDB file of the main conformer.
         """
         if conformers:
-            pdbfiles = [PDBExportable.to_pdb(self)]
+            pdbfiles = [PDBExportable.to_pdb(self, **kwargs)]
             for extra in self.extra_xyz:
-                print(extra.name, extra.numAtoms)
-                pdbfiles.append(PDBExportable.to_pdb(self, molecule=extra))
+                pdbfiles.append(PDBExportable.to_pdb(self, molecule=extra, **kwargs))
             return pdbfiles
         return PDBExportable.to_pdb(self)
 
