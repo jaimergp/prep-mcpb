@@ -1,3 +1,10 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+"""
+Prepare files for MCPB.py using (py)Chimera
+===========================================
+"""
 
 from __future__ import print_function
 try:
@@ -34,6 +41,9 @@ from AddH import cmdAddH
 from AddCharge import estimateNetCharge
 from SplitMolecule.split import molecule_from_atoms, split_connected
 from Combine import cmdCombine
+
+__version__ = "0.0.2"
+__author__ = "Jaime Rodríguez-Guerra"
 
 
 ### BASE OBJECTS
@@ -129,7 +139,7 @@ class MCPBWorkspace(object):
         naa_mol2files, frcmod_files = [], []
         for ligand in nonstd_residues:
             files = ligand.parameterize()
-            pdbfiles.append(files['pdb'])
+            pdbfiles.extend(ligand.to_pdb(conformers=True))
             self.write(files['mol2'], ligand.name + '.mol2')
             self.write(files['frcmod'], ligand.name + '.frcmod')
             naa_mol2files.append(ligand.name + '.mol2')
@@ -139,7 +149,7 @@ class MCPBWorkspace(object):
             pdbfiles.append(protein.to_pdb(fix=True))
 
         self.write(self.master_pdb(pdbfiles), 'master.pdb')
-        inputfile = self.mcpb_input(ion_ids=ion_ids, ion_mol2files=ion_mol2files,
+        inputfile = self.mcpb_input(ion_ids=ion_ids, ion_mol2files=sorted(set(ion_mol2files)),
                                     naa_mol2files=naa_mol2files, frcmod_files=frcmod_files)
         self.write(inputfile, 'mcpb.in')
 
@@ -153,7 +163,6 @@ class MCPBWorkspace(object):
         pdbfixer.write_pdb(s)
         s.seek(0)
         s = s.read()
-        print(s)
         return s
 
     def mcpb_input(self, ion_ids, ion_mol2files, naa_mol2files=(), frcmod_files=()):
@@ -355,7 +364,8 @@ class MetalResidue(PDBExportable):
             atoms_by_element[a.element.name].append(a)
         atomindex = 0
         for resindex, (element, atomlist) in enumerate(sorted(atoms_by_element.items()), 1):
-            residue = self.molecule.newResidue(element.upper(), 'A', resindex, ' ')
+            oldres = atomlist[0].residue
+            residue = self.molecule.newResidue(element.upper(), oldres.id.chainId, oldres.id.position, ' ')
             for atom in atomlist:
                 atomindex += 1
                 new_atom = self.molecule.newAtom(atom.name, atom.element, atomindex)
@@ -417,7 +427,10 @@ class NonStandardResidueProvider(object):
 
         TODO: Identify topologically identical pieces
         """
-        atoms = chimera_selection('~protein&~solvent', models=[self.molecule]).atoms()
+        # Find anything that is not a protein nor solvent,
+        # but do choose solvent with pseudobonds (metal-coordinated)
+        atoms = chimera_selection('~protein&~solvent|solvent&@/pseudoBonds',
+                                  models=[self.molecule]).atoms()
         candidate_atoms = [a for a in atoms if not a.element.isMetal]
         pieces_by_resname = defaultdict(list)
         for i, atoms in split_connected(candidate_atoms):
@@ -426,15 +439,21 @@ class NonStandardResidueProvider(object):
             else:
                 pieces_by_resname[atoms[0].residue.type].append(atoms)
 
-        # TODO: Review if this is needed or not
-        # for resname, pieces in pieces_by_resname.items():
-        #     if len(pieces) > 1:  # rename residues with more than one group of atoms
-        #         for i, piece in enumerate(pieces, 1):
-        #             pieces_by_resname[resname[:-1] + str(i)] = [piece]
-        #         del pieces_by_resname[resname]
+        for resname, pieces in pieces_by_resname.items():
+            if len(pieces) > 1:
+                # check if they are topologically equivalent
+                # in the mean time, the number of atoms should suffice
+                num_atoms = max([len(p) for p in pieces])  # biggest piece is considered the main
+                for i, piece in enumerate(pieces):
+                    if len(piece) != num_atoms:
+                        new_resname = resname[:-1] + str(i+1)  # TODO: Check valid resname
+                        pieces_by_resname[new_resname] = piece
+                        pieces.pop(i)
 
         residues = []
         for resname, piece in sorted(pieces_by_resname.items()):
+            for p in piece:
+                print(p[0].residue.type, len(p))
             residues.append(NonStandardResidue(piece[0], name=resname, extra_xyz=piece[1:], **kwargs))
         return residues
 
@@ -474,10 +493,11 @@ class NonStandardResidue(PDBExportable):
         #         raise ValueError('`extra_xyz` must be of shape (n, 3)')
         #     cs = self.molecule.newCoordSet(i)
         #     cs.load(xyz)
-        if not all([m.numAtoms == len(atoms) for m in extra_xyz]):
+        if not all([len(m) == len(atoms) for m in extra_xyz]):
             raise ValueError("Extra molecules must have same number of atoms as the main one!")
         else:
-            self.extra_xyz = [molecule_from_atoms(at[0].molecule, at, name=self.name) for at in extra_xyz]
+            self.extra_xyz = [molecule_from_atoms(at[0].molecule, at, name=self.name)
+                              for at in extra_xyz]
         if charge is None:
             charge = estimateNetCharge(atoms)
         self.charge = charge
@@ -502,7 +522,7 @@ class NonStandardResidue(PDBExportable):
         frcmod = self.name + '.frcmod'
         with enter_temporary_directory(delete=False) as tmpdir:
             with open(pdb, 'w') as f:
-                f.write(self.to_pdb(replicas=False))
+                f.write(self.to_pdb(conformers=False))
 
             # Run antechamber
             options = {'atom_type': atom_type, 'charge_method': charge_method, 'net_charge': self.charge}
@@ -540,20 +560,30 @@ class NonStandardResidue(PDBExportable):
 
         return result
 
-    def to_pdb(self, replicas=True):
+    def to_pdb(self, conformers=True):
         """
         Export current molecule to a PDB file
 
         Parameters
         ==========
-        replicas : bool, optional=True
+        conformers : bool, optional=True
             Whether to include all the copies of the ligand or
             only the primary one. Set to True when building the
             master, False for parameterization.
+
+        Returns
+        =======
+        str or list of str
+            If conformers=True, list of str for PDB files for the main conformer
+            and each variant. If False, str of PDB file of the main conformer.
         """
-        if replicas:
-            multimol = cmdCombine  # TODO: combine all replicas in a new multiresidue molecule
-        return PDBExportable.to_pdb(self, allFrames=replicas)
+        if conformers:
+            pdbfiles = [PDBExportable.to_pdb(self)]
+            for extra in self.extra_xyz:
+                print(extra.name, extra.numAtoms)
+                pdbfiles.append(PDBExportable.to_pdb(self, molecule=extra))
+            return pdbfiles
+        return PDBExportable.to_pdb(self)
 
 
 
