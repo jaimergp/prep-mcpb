@@ -44,10 +44,6 @@ except ImportError:
                       "Install it with `conda install -c AmberMD ambertools`.")
 
 
-__version__ = "0.0.2"
-__author__ = "Jaime Rodríguez-Guerra"
-
-
 ### BASE OBJECTS
 
 _valid_resname_characters = string.ascii_letters + string.digits + '-+'
