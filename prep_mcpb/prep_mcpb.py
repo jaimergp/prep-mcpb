@@ -7,46 +7,49 @@ Prepare files for MCPB.py using (py)Chimera
 """
 
 from __future__ import print_function
+import os
+import shutil
+import string
+from argparse import ArgumentParser
+from collections import defaultdict, namedtuple, Counter
+from contextlib import contextmanager
+from cStringIO import StringIO
+from itertools import combinations
+from subprocess import check_call, CalledProcessError
+from tempfile import mkdtemp
+from textwrap import dedent
+
+import numpy as np
+
+
 try:
     from pychimera import patch_environ, load_chimera
     patch_environ()
     load_chimera()
+    import chimera
+    from AddCharge import estimateNetCharge
+    from AddH import cmdAddH
+    from chimera.specifier import evalSpec as chimera_selection
+    from Combine import cmdCombine
+    from SplitMolecule.split import molecule_from_atoms, split_connected
 except ImportError:
-    raise ImportError("This script needs PyChimera. "
+    raise ImportError("prep_mcpb needs PyChimera. "
                       "Install it with `conda install -c insilichem pychimera`.")
 
 try:
-    from pdb4amber import AmberPDBFixer
     import parmed as pmd
+    from pdb4amber import AmberPDBFixer
 except ImportError:
-    raise ImportError("This script needs AmberTools. "
+    raise ImportError("prep_mcpb needs AmberTools. "
                       "Install it with `conda install -c AmberMD ambertools`.")
 
-import os
-import string
-import shutil
-from collections import defaultdict
-from textwrap import dedent
-from cStringIO import StringIO
-from subprocess import check_call, CalledProcessError
-from contextlib import contextmanager
-from argparse import ArgumentParser
-from tempfile import mkdtemp
-
-import numpy as np
-
-import chimera
-from chimera.specifier import evalSpec as chimera_selection
-from AddH import cmdAddH
-from AddCharge import estimateNetCharge
-from SplitMolecule.split import molecule_from_atoms, split_connected
-from Combine import cmdCombine
 
 __version__ = "0.0.2"
 __author__ = "Jaime Rodríguez-Guerra"
 
 
 ### BASE OBJECTS
+
 _valid_resname_characters = string.ascii_letters + string.digits + '-+'
 _valid_filename_characters = '_()[] ' + _valid_resname_characters
 def validate_short_id(s, max_length=6, valid=_valid_filename_characters):
@@ -67,9 +70,13 @@ class MCPBWorkspace(object):
         Base directory that will store everything
     prefix : str
         Short identifier that will prefix all filenames
+    reduce : bool
+        Whether to use Amber's reduce to add hydrogens to protein only
+    parameterize : bool
+        Run antechamber + parmchk2 automatically in non-std residues
     """
 
-    def __init__(self, root, prefix=None):
+    def __init__(self, root, prefix=None, reduce=True, parameterize=True):
         try:
             os.makedirs(root)
         except OSError:
@@ -78,7 +85,9 @@ class MCPBWorkspace(object):
         self.root = root
         if prefix is None:
             prefix = os.path.basename(root)[:4]
-        self.prefix = validate_short_id(prefix)
+        self.prefix = validate_short_id(prefix[:6])
+        self.reduce = reduce
+        self.parameterize = parameterize
 
     def write(self, contents, filename, directory=None, prefix=None):
         """
@@ -138,15 +147,16 @@ class MCPBWorkspace(object):
         ion_ids = range(1, n_metals+1)
         naa_mol2files, frcmod_files = [], []
         for ligand in nonstd_residues:
-            files = ligand.parameterize()
             pdbfiles.extend(ligand.to_pdb(conformers=True))
-            self.write(files['mol2'], ligand.name + '.mol2')
-            self.write(files['frcmod'], ligand.name + '.frcmod')
-            naa_mol2files.append(ligand.name + '.mol2')
-            frcmod_files.append(ligand.name + '.frcmod')
+            if self.parameterize:
+                files = ligand.parameterize()
+                self.write(files['mol2'], ligand.name + '.mol2')
+                self.write(files['frcmod'], ligand.name + '.frcmod')
+                naa_mol2files.append(ligand.name + '.mol2')
+                frcmod_files.append(ligand.name + '.frcmod')
 
         if protein:
-            pdbfiles.append(protein.to_pdb(fix=True))
+            pdbfiles.append(protein.to_pdb(fix=True, add_h=self.reduce))
 
         self.write(self.master_pdb(pdbfiles), 'master.pdb')
         inputfile = self.mcpb_input(ion_ids=ion_ids, ion_mol2files=sorted(set(ion_mol2files)),
@@ -368,7 +378,7 @@ class MetalResidue(PDBExportable):
             residue = self.molecule.newResidue(element.upper(), oldres.id.chainId, oldres.id.position, ' ')
             for atom in atomlist:
                 atomindex += 1
-                new_atom = self.molecule.newAtom(atom.name, atom.element, atomindex)
+                new_atom = self.molecule.newAtom(atom.element.name.upper(), atom.element, atomindex)
                 new_atom.charge = estimateNetCharge([new_atom])
                 new_atom.setCoord(atom.coord())
                 residue.addAtom(new_atom)
@@ -439,23 +449,72 @@ class NonStandardResidueProvider(object):
             else:
                 pieces_by_resname[atoms[0].residue.type].append(atoms)
 
-        for resname, pieces in pieces_by_resname.items():
-            if len(pieces) > 1:
-                # check if they are topologically equivalent
-                # in the mean time, the number of atoms should suffice
-                num_atoms = max([len(p) for p in pieces])  # biggest piece is considered the main
-                for i, piece in enumerate(pieces):
-                    if len(piece) != num_atoms:
-                        new_resname = resname[:-1] + str(i+1)  # TODO: Check valid resname
-                        pieces_by_resname[new_resname] = piece
-                        pieces.pop(i)
+        pieces_by_topology = self.detect_topologies([p for pieces in pieces_by_resname.values()
+                                                     for p in pieces])
 
         residues = []
-        for resname, piece in sorted(pieces_by_resname.items()):
-            for p in piece:
-                print(p[0].residue.type, len(p))
+        print('Detected', len(pieces_by_topology), 'non-std residues:')
+        for resname, piece in sorted(pieces_by_topology.items()):
+            print(' ', resname, 'of', len(piece[0]), 'atoms, has', len(piece[1:]), 'replicas')
+            for replica in piece[1:]:
+                print('  ', len(replica))
             residues.append(NonStandardResidue(piece[0], name=resname, extra_xyz=piece[1:], **kwargs))
         return residues
+
+    def detect_topologies(self, pieces):
+        """
+        Detect topologically equivalent pieces in a given list
+        of groups of connected atoms (residues)
+
+        Parameters
+        ==========
+        pieces : list of list of chimera.Atom
+            Each sublist of chimera.Atom is considered a connected residue
+
+        Returns
+        =======
+        pieces_by_topology : dict
+            Mapping of residue name to list of groups of atoms
+        """
+        pieces_by_topology = defaultdict(list)
+        pieces = sorted(pieces, key=len, reverse=True)
+        # Seed it with the biggest structure
+        pieces_by_topology[pieces[0][0].residue.type].append(pieces[0])
+        for p in pieces[1:]:
+            for tname, tops in pieces_by_topology.items():
+                if self._same_topology(p, tops[0]):
+                    pieces_by_topology[tname].append(p)
+                    break
+            else:
+                i = 0
+                pname = p[0].residue.type
+                while pname in pieces_by_topology:
+                    pname = pname[:-1] + str(i)
+                    i += 1
+                pieces_by_topology[pname].append(p)
+        return pieces_by_topology
+
+    @staticmethod
+    def _same_topology(a, b):
+        """
+        Test if two groups of atoms are topologically equivalent
+
+        Parameters
+        ==========
+        a, b : list of chimera.Atoms
+        """
+        # Same number of atoms?
+        if len(a) != len(b):
+            return False
+        # Same formula?
+        if Counter([at.element.name for at in a]) != Counter([at.element.name for at in b]):
+            return False
+        # Same residue names? (give the user an opportunity to separate them manually)
+        if Counter([at.residue.type for at in a]) != Counter([at.residue.type for at in b]):
+            return False
+        # TODO: test bond graph (connectivity)
+        # for now we are trusting that isomers are labeled differently
+        return True
 
 
 class NonStandardResidue(PDBExportable):
@@ -466,7 +525,8 @@ class NonStandardResidue(PDBExportable):
     Parameters
     ==========
     atoms : list of chimera.Atom
-        Atoms that will build the final residue
+        Atoms that will build the final residue. They should be part
+        of the same chimera.Residue.
     name : str, optional
         A short identifier
     charge : int, optional
@@ -480,19 +540,27 @@ class NonStandardResidue(PDBExportable):
         Used by antechamber.
     charge_method : str, optional=bcc
         Used by antechamber. Choose between
+    rename_atoms : bool, optional=True
+        If ``extra_xyz`` molecules are provided, atom names should match the main one. Setting
+        this to True will enforce that rule.
     """
     _charge_methods = 'resp bcc cm2 esp mul gas'.split()
     _atom_types = 'gaff gaff2'.split()
-    def __init__(self, atoms, name=None, charge=None, extra_xyz=(), atom_type='gaff', charge_method='bcc'):
+    def __init__(self, atoms, name=None, charge=None, extra_xyz=(), atom_type='gaff', charge_method='bcc',
+                 rename_atoms=True):
         if name is None:
             name = atoms[0].residue.type
-        self.name = validate_short_id(name)
-        self.molecule = molecule_from_atoms(atoms[0].molecule, atoms, name=self.name)
+        self.name = validate_short_id(name, max_length=3, valid=_valid_resname_characters)
+        self.rename_atoms = rename_atoms
+
+        self.molecule = self.molecular_residue_from_atoms(atoms, rename_atoms=self.rename_atoms)
         if not all([len(m) == len(atoms) for m in extra_xyz]):
-            raise ValueError("Extra molecules must have same number of atoms as the main one!")
+            raise ValueError("Extra molecules for {} must have same number of atoms "
+                             "as the main one ({})!".format(self.name, len(atoms)))
         else:
-            self.extra_xyz = [molecule_from_atoms(at[0].molecule, at, name=self.name)
-                              for at in extra_xyz]
+            self.extra_xyz = [self.molecular_residue_from_atoms(atoms, rename_atoms=self.rename_atoms, index=i)
+                              for i, atoms in enumerate(extra_xyz, 2)]
+
         if charge is None:
             charge = estimateNetCharge(atoms)
         self.charge = charge
@@ -579,6 +647,32 @@ class NonStandardResidue(PDBExportable):
             return pdbfiles
         return PDBExportable.to_pdb(self)
 
+    def molecular_residue_from_atoms(self, atoms, rename_atoms=True, index=1):
+        """
+        Create a new chimera.Molecule instance from a set of atoms,
+        guaranteeing that they will only constitute one chimera.Residue
+        """
+        m = chimera.Molecule()
+        m.name = self.name
+        r = m.newResidue(self.name, 'A', index, ' ')
+        old2new = {}
+        for serial, atom in enumerate(atoms, 1):
+            new_atom = m.newAtom(atom.name, atom.element, serial)
+            new_atom.setCoord(atom.coord())
+            r.addAtom(new_atom)
+            old2new[atom] = new_atom
+
+        for bond in set([bond for a in atoms for bond in a.bonds]):
+            if all(a in old2new for a in bond.atoms):
+                b = m.newBond(old2new[bond.atoms[0]], old2new[bond.atoms[1]])
+
+        if rename_atoms:
+            element_names = defaultdict(int)
+            for root in m.roots(True):
+                for atom in m.traverseAtoms(root):
+                    element_names[atom.element.name] += 1
+                    atom.name = '{}{}'.format(atom.element.name.upper(), element_names[atom.element.name])
+        return m
 
 
 ### PROTEIN OBJECTS
@@ -589,7 +683,7 @@ class ProteinProvider(object):
         self.molecule = molecule
         if name is None:
             name = molecule.name.split()[0][:4]
-        self.name = validate_short_id(name)
+        self.name = validate_short_id(name, max_length=4, valid=_valid_resname_characters)
 
     def detect(self):
         atoms = chimera_selection('protein', models=[self.molecule]).atoms()
@@ -602,7 +696,7 @@ class Protein(PDBExportable):
     def __init__(self, atoms, name=None):
         if name is None:
             name = atoms[0].molecule.name.split([0])[:4]
-        self.name = validate_short_id(name)
+        self.name = validate_short_id(name, max_length=4, valid=_valid_resname_characters)
         self.molecule = molecule_from_atoms(atoms[0].molecule, atoms, name=self.name)
 
     def fix(self, add_h=True):
@@ -632,11 +726,13 @@ class Protein(PDBExportable):
         output.seek(0)
         return output.read()
 
-    def to_pdb(self, fix=False):
+    def to_pdb(self, fix=False, **kwargs):
         if fix:
-            return self.fix()
+            return self.fix(**kwargs)
         return PDBExportable.to_pdb(self)
 
+
+## UTILS
 
 @contextmanager
 def enter_temporary_directory(delete=True, **kwargs):
@@ -665,6 +761,11 @@ def parse_cli():
         help='Atoms to be removed from original structure. By default, only the solvent. '
              'Any query supported by UCSF Chimera atom-spec can be used. For example, '
              'it can be used to delete unneeded NMR models with ~#0.1.')
+    p.add_argument('--no_reduce', action='store_true',
+        help='Do not try to add hydrogens to the molecule automatically.')
+    p.add_argument('--no_parameterize', action='store_true',
+        help='Do not run antechamber+parmchk in non-std residues '
+             '(useful for debugging piece identification).')
     p.add_argument('--charge_method', choices='resp bcc cm2 esp mul gas'.split(),
         default='bcc', help='Charge method to use with antechamber. Default is bcc.')
     p.add_argument('--atom_type', choices='gaff gaff2'.split(),
@@ -687,7 +788,8 @@ def main():
     # Load requested structure and do global fixes
     structure = RawStructure(args.structure, name=name)
     structure.strip(to_remove=args.strip)
-    structure.add_h()
+    if not args.no_reduce:
+        structure.add_h()
 
     # Discover components
     metals = structure.metals(cluster_cutoff=args.cluster_cutoff)
@@ -695,7 +797,8 @@ def main():
     protein = structure.protein()
 
     # Write everything to the results directory
-    workspace = MCPBWorkspace(args.path, prefix=name)
+    workspace = MCPBWorkspace(args.path, prefix=name, reduce=not args.no_reduce,
+                              parameterize=not args.no_parameterize)
     workspace.save(metals=metals, nonstd_residues=nonstd_residues, protein=protein)
 
 
